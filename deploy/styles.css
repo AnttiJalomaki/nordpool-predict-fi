@@ -12,13 +12,23 @@ body {
     max-width: 920px;
     margin: auto;
     box-sizing: border-box;
-    padding-top: 32px;
+    padding-top: 24px;
+}
+
+#windPowerChart {
+    max-width: 920px;
+    margin: auto;
+    box-sizing: border-box;
+    height: 40vh;
+    width: 100%;
+    padding-top: 24px;
 }
 
 #chart {
     max-width: 920px;
     margin: auto;
     box-sizing: border-box;
+    padding-top: 12px;
 }
 
 #predictionText {
@@ -115,7 +125,6 @@ body {
 #source-code-text:hover {
     color: #666;
     text-decoration: none;
-    // font-size: 0.8em;
     opacity: 0.8;
 }
 
@@ -171,6 +180,20 @@ li {
     margin-left: 16px;
     padding-left: 16px;
     text-indent: -16px;
+}
+
+table {
+    width: 100%;
+    font-size: 0.8em;
+    border-collapse: separate;
+    border-spacing: 2px;
+    margin: auto;
+}
+
+th, td {
+    vertical-align: middle;
+    /* text-align: center; */
+    padding: 2px;
 }
 
 @media (max-width: 768px) {

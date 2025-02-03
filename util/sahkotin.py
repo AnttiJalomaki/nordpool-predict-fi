@@ -3,6 +3,7 @@ import requests
 from datetime import datetime, timedelta
 import pytz
 import sys
+from rich import print
 
 def fetch_electricity_price_data(start_date, end_date):
     """
@@ -13,7 +14,7 @@ def fetch_electricity_price_data(start_date, end_date):
     - end_date (str): The end datetime in ISO format.
 
     Returns:
-    - pd.DataFrame: A DataFrame with two columns ['Timestamp', 'Price_cpkWh'] where 'Timestamp' is the datetime and 'Price_cpkWh' is the electricity price.
+    - pd.DataFrame: A DataFrame with two columns ['timestamp', 'Price_cpkWh'] where 'timestamp' is the datetime and 'Price_cpkWh' is the electricity price.
     """
     api_url = "https://sahkotin.fi/prices?vat"
     params = {
@@ -42,17 +43,17 @@ def fetch_electricity_price_data(start_date, end_date):
             try:
                 df['date'] = pd.to_datetime(df['date'], utc=True)
                 df['value'] = df['value'] / 10
-                df.rename(columns={'date': 'Timestamp', 'value': 'Price_cpkWh'}, inplace=True)
+                df.rename(columns={'date': 'timestamp', 'value': 'Price_cpkWh'}, inplace=True)
             except Exception as e:
                 print(f"Error processing data from Sähkötin API: {e}")
                 sys.exit(1)
             return df
         else:
             print("No data returned from the API.")
-            return pd.DataFrame(columns=['Timestamp', 'Price_cpkWh'])
+            return pd.DataFrame(columns=['timestamp', 'Price_cpkWh'])
     else:
         print(f"Failed to fetch electricity price data: {response.text}")
-        return pd.DataFrame(columns=['Timestamp', 'Price_cpkWh'])
+        return pd.DataFrame(columns=['timestamp', 'Price_cpkWh'])
 
 
 def clean_up_df_after_merge(df):
@@ -90,25 +91,28 @@ def update_spot(df):
     Updates the input DataFrame with electricity price data fetched from sahkotin.fi.
 
     Parameters:
-    - df (pd.DataFrame): The input DataFrame containing a 'Timestamp' column.
+    - df (pd.DataFrame): The input DataFrame containing a 'timestamp' column.
 
     Returns:
     - pd.DataFrame: The updated DataFrame with electricity price data.
     """
     current_date = datetime.now(pytz.UTC).strftime("%Y-%m-%dT%H:%M:%S.000Z")
     history_date = (datetime.now(pytz.UTC) - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-    end_date = (datetime.now(pytz.UTC) + timedelta(hours=120)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    end_date = (datetime.now(pytz.UTC) + timedelta(days=8)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
     
-    print(f"* Fetching electricity price data between {history_date[:10]} and {end_date[:10]}")
+    print(f"* Sähkötin: Fetching electricity price data between {history_date[:10]} and {end_date[:10]}")
     
     price_df = fetch_electricity_price_data(history_date, end_date)   
     
     if not price_df.empty:
-        df['Timestamp'] = pd.to_datetime(df['Timestamp'], utc=True)
-        merged_df = pd.merge(df, price_df, on='Timestamp', how='left')
+        df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
+        merged_df = pd.merge(df, price_df, on='timestamp', how='left')
        
         merged_df = clean_up_df_after_merge(merged_df)
-               
+
+        # Interpolate to fill NaN values in 'Price_cpkWh'
+        merged_df['Price_cpkWh'] = merged_df['Price_cpkWh'].interpolate(method='cubic')
+
         return merged_df
     else:
         print("Warning: No electricity price data fetched; unable to update DataFrame.")

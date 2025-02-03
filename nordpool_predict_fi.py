@@ -1,34 +1,44 @@
 import os
 import json
 import pytz
-import joblib
 import argparse
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
-
-from util.eval import eval
+from rich import print
+from datetime import datetime
 from dotenv import load_dotenv
-from util.train import train_model
 from util.dump import dump_sqlite_db
 from util.sahkotin import update_spot
-from util.fingrid import update_nuclear
+from util.train_xgb import train_model
 from util.llm import narrate_prediction
-from datetime import datetime, timedelta
 from util.entso_e import entso_e_nuclear
+from util.holidays import update_holidays
 from util.sql import db_update, db_query_all
-from util.github import push_updates_to_github
 from util.dataframes import update_df_from_df
+from util.fingrid_nuclear import update_nuclear
+from util.openmeteo_windpower import update_eu_ws
+from util.jao_imports import update_import_capacity
 from util.fmi import update_wind_speed, update_temperature
-from util.models import write_model_stats, stats, list_models
+from util.openmeteo_solar import update_solar
 from util.eval import create_prediction_snapshot, rotate_snapshots
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
+# Wind power model choices: nn vs xgb
+# from util.fingrid_windpower_nn import update_windpower
+from util.fingrid_windpower_xgb import update_windpower
+
+# -----------------------------------------------------------------------------------------------------------------------------
+# Configure pandas to display all rows
+pd.set_option('display.max_rows', None)
+
+# Set the global print option for float format
+pd.options.display.float_format = '{:.1f}'.format
+
+# -----------------------------------------------------------------------------------------------------------------------------
+# Fetch environment variables from .env.local (create yours from .env.template)
 try:
-    load_dotenv('.env.local')  # take environment variables from .env.local
+    load_dotenv('.env.local')
 except Exception as e:
-    print(f"Error loading .env.local file. Did you create one? See README.md.")
+    print(f"[ERROR] Can't find .env.local. Did you create one? See README.md.")
 
 # Fetch mandatory environment variables and raise exceptions if they are missing
 def get_mandatory_env_variable(name):
@@ -37,12 +47,11 @@ def get_mandatory_env_variable(name):
         raise ValueError(f"Mandatory variable {name} not set in environment")
     return value
 
+# Configuration and secrets, mandatory:
 try:
-    # Configuration and secrets, mandatory:
-    rf_model_path = get_mandatory_env_variable('RF_MODEL_PATH')
     data_folder_path = get_mandatory_env_variable('DATA_FOLDER_PATH')
+    deploy_folder_path = get_mandatory_env_variable('DEPLOY_FOLDER_PATH')
     db_path = get_mandatory_env_variable('DB_PATH')
-    repo_path = get_mandatory_env_variable('REPO_PATH')
     predictions_file = get_mandatory_env_variable('PREDICTIONS_FILE')
     averages_file = get_mandatory_env_variable('AVERAGES_FILE')
     fingrid_api_key = get_mandatory_env_variable('FINGRID_API_KEY')
@@ -56,290 +65,211 @@ except ValueError as e:
     print(f"Error: {e}")
     exit(1)
 
-# Optional env variables for --github or --narrate:
-openai_api_key = os.getenv('OPENAI_API_KEY') # OpenAI API key, used by --narrate
-narration_file = os.getenv('NARRATION_FILE') # used by --narrate
-token = os.getenv('TOKEN') # used by --github
-commit_message = os.getenv('COMMIT_MESSAGE') # used by --github
-deploy_folder_path = os.getenv('DEPLOY_FOLDER_PATH') # used by --github
+# Optional env variables for --narrate:
+openai_api_key = os.getenv('OPENAI_API_KEY')  # OpenAI API key, used by --narrate
+narration_file = os.getenv('NARRATION_FILE')  # used by --narrate
 
-# Arguments
+# -----------------------------------------------------------------------------------------------------------------------------
+# Command line arguments
 parser = argparse.ArgumentParser()
-parser.add_argument('--train', action='store_true', help='Train a new model candidate using the data in the database')
-parser.add_argument('--eval', action='store_true', help='Show evaluation metrics for the current database')
-parser.add_argument('--training-stats', action='store_true', help='Show training stats for candidate models in the database as a CSV')
-parser.add_argument('--dump', action='store_true', help='Dump the SQLite database to CSV format')
-parser.add_argument('--plot', action='store_true', help='Plot all predictions and actual prices to a PNG file in the data folder')
-parser.add_argument('--predict', action='store_true', help='Generate price predictions from now onwards')
-parser.add_argument('--add-history', action='store_true', help='Add all missing predictions to the database post-hoc; use with --predict')
+parser.add_argument('--train', action='store_true', help='[Deprecated] Train a new model candidate using the data in the database')
+parser.add_argument('--predict', action='store_true', help='Train a model (in memory) and display price predictions')
 parser.add_argument('--narrate', action='store_true', help='Narrate the predictions into text using an LLM')
-parser.add_argument('--commit', action='store_true', help='Commit the results to DB and deploy folder; use with --predict, --narrate')
-parser.add_argument('--deploy', action='store_true', help='Deploy the output files to the deploy folder but not GitHub')
-# --publish will be deprecated in the future, prefer --deploy instead:
-parser.add_argument('--publish', action='store_true', help='Deploy the output files to the deploy folder but not GitHub', dest='deploy') #redirected
-parser.add_argument('--github', action='store_true', help='Push the deployed files to a GitHub repo; use with --deploy')
-
+parser.add_argument('--commit', action='store_true', help='Commit the predictions/narrations results to DB; use with --predict, --narrate')
+parser.add_argument('--deploy', action='store_true', help='Deploy the output files to the web folder')
+parser.add_argument('--dump', action='store_true', help='Dump the SQLite database to CSV format')
+parser.add_argument('--nn', action='store_true', help='Use neural network model(s) instead of XGBoost')
 args = parser.parse_args()
 
-# Start with a timestamp intro to STDOUT, but not if we're here to dump the database as CSV
-if not args.dump:
-    print(datetime.now().strftime("[%Y-%m-%d %H:%M:%S]"), "Nordpool Predict FI")
-
-# Train a model with new data and make it available for the rest of the script
-rf_trained = None
-
-if args.train:
-    
-    print("Training a new model candidate using the data in the database...")
-    print("* FMI Weather Stations for Wind:", fmisid_ws)
-    print("* FMI Weather Stations for Temperature:", fmisid_t)
-    
-    # Continuous training: Get all the data from the database
-    df = db_query_all(db_path)
-
-    # Ensure 'timestamp' column is in datetime format
-    df['timestamp'] = pd.to_datetime(df['timestamp'])
-
-    # If WindPowerCapacityMW is null, fill it with the last known value
-    df['WindPowerCapacityMW'] = df['WindPowerCapacityMW'].fillna(method='ffill')
-    
-    # If NuclearPowerMW is null, fill it with the last known value
-    df['NuclearPowerMW'] = df['NuclearPowerMW'].fillna(method='ffill')
-    
-    # Define other required columns
-    required_columns = ['timestamp', 'NuclearPowerMW', 'Price_cpkWh'] + fmisid_ws + fmisid_t
-
-    # Drop rows with missing values in the cleaned required columns list
-    df = df.dropna(subset=required_columns)
-      
-    # This will produce a "candidate.joblib" file in the model folder
-    # You can rename it to "rf_model.joblib" if you want to use it in the prediction process
-    
-    # Re-training of a model, and save it to the model folder
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    model_path = f'model/candidate_{timestamp}.joblib'
-
-    # Train a model and fetch the stats for it
-    mae, mse, r2, samples_mae, samples_mse, samples_r2, rf_trained = train_model(df, fmisid_ws=fmisid_ws, fmisid_t=fmisid_t)
-    
-    print(f"→ Model trained:\n  MAE (vs test set): {mae}\n  MSE (vs test set): {mse}\n  R² (vs test set): {r2}\n  MAE (vs 10x500 randoms): {samples_mae}\n  MSE (vs 10x500 randoms): {samples_mse}\n  R² (vs 10x500 randoms): {samples_r2}")
-
-    # If we're moving towards --predict, we're not saving, it's continuous training then
-    if args.commit and not args.predict:
-        joblib.dump(rf_trained, model_path)
-        print(f"→ Model saved to {model_path}")
-
-        # Add the training stats to the database
-        write_model_stats(timestamp, mae, mse, r2, samples_mae, samples_mse, samples_r2, model_path)
-        print("→ Model stats added to the database.")
-        print("→ Training done.")
-    else:
-        print("→ Model NOT saved to the database but remains available in memory for --prediction.")
-        print("→ Training done.")
-
-# Show evals based on the current database
-if args.eval:
-    print(eval(db_path))
-
-# Show training stats for all models in the database as CSV
-if args.training_stats:
-    print("Training stats for all models in the database:")
-
-    model_timestamps = list_models()
-    # Sort the timestamps in ascending order
-    model_timestamps.sort()
-    print("Model Timestamps:", model_timestamps)
-
-    # Define the header
-    header = ['training_id', 'training_timestamp', 'MAE', 'MSE', 'R2', 'samples_MAE', 'samples_MSE', 'samples_R2', 'model_path']
-
-    # Print the header, joined by commas
-    print(','.join(header))
-
-    # Iterate through each model and print its stats
-    for model in model_timestamps:
-        model_stats = stats(model)
-
-        # Create a list of the model's stats, converted to strings
-        row = [str(model_stats.get(field, '')) for field in header]
-
-        # Print the row, joined by commas
-        print(','.join(row))
-        
-    exit()
-
-if args.dump: 
+# -----------------------------------------------------------------------------------------------------------------------------
+# --dump: Dump the SQLite database as CSV to STDOUT
+if args.dump:
     dump_sqlite_db(data_folder_path)
     exit()
+else:
+    # Startup message
+    print(datetime.now().strftime("[%Y-%m-%d %H:%M:%S]"), "Nordpool Predict FI")
 
-if args.plot:
-    fig, ax = plt.subplots(figsize=(12, 8))  # Huge
+# -----------------------------------------------------------------------------------------------------------------------------
+# Deprecate --train option
+if args.train:
+    print("[WARNING] The --train option is deprecated and is no longer used. Training is now performed automatically during prediction.")
 
-    # Convert 'timestamp' to datetime for plotting
-    df = db_query_all(db_path)
-    df['timestamp'] = pd.to_datetime(df['timestamp'])
-    
-    # Drop rows with missing values
-    df = df.dropna()
-
-    ax.plot(df['timestamp'], df['Price_cpkWh'], label='Nordpool', linewidth=0.33)
-    ax.plot(df['timestamp'], df['PricePredict_cpkWh'], label='Predicted', linewidth=0.33)
-
-    # Format the x-axis to display dates
-    ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
-    plt.xticks(rotation=45)  # Rotate x-axis labels for better readability
-
-    # Add labels and title
-    ax.set_xlabel('Timestamp')
-    ax.set_ylabel('Price_cpkWh')
-    ax.set_title('Nordpool vs predicted prices')
-    ax.legend()
-
-    # Set y-axis to log scale and add gridlines
-    ax.grid(True, which="both", ls="--", color='0.65')
-
-    # Save the plot to a file (date).png
-    output_file = os.path.join(data_folder_path, datetime.now().strftime("plot-%Y-%m-%d") + ".png")
-    plt.savefig(output_file)
-    print(f"Plot saved to {output_file}")
-
-    exit()
-
+# -----------------------------------------------------------------------------------------------------------------------------
 if args.predict:
-    print("Running predictions...")
+    print("Loading data from the database")
+    df_full = db_query_all(db_path)
+    df_full['timestamp'] = pd.to_datetime(df_full['timestamp'])
+    df_full.set_index('timestamp', inplace=True)
+    df_full.reset_index(inplace=True)
 
-    # Fetch all the data, as we have more memory than time and it's not that large
-    df = db_query_all(db_path)
-    
-    # Ensure 'timestamp' column is in datetime format
-    df['timestamp'] = pd.to_datetime(df['timestamp'])
-    df.set_index('timestamp', inplace=True)
-        
-    # We operate from this moment back and forward
+    # Print the head of the DataFrame
+    # print(df_full.head(48))
+
+    df_full.set_index('timestamp', inplace=True)
+
+    # Temporarily restore "timestamp" column for the update functions
+    df_full.reset_index(inplace=True)
+
+    # Update the DF with holiday indicators
+    df_full = update_holidays(df_full)
+
+    # Update the DF with solar irradiation data
+    # The API call is quick, including for historical data; these won't be committed to the DB for now (2024-12-28)
+    df_full = update_solar(df_full)
+
+    # Restore the index
+    df_full.set_index('timestamp', inplace=True)
+
+    # Define 'now' and the recent period
     now = pd.Timestamp.utcnow()
-
-    # Round up to the next full hour if not already on a full hour
     if now.minute > 0 or now.second > 0 or now.microsecond > 0:
         now = now.ceil('h')  # Rounds up to the nearest hour
-        
-    # Drop rows that are older than a week, unless we intend to do a retrospective prediction update after a model update
-    if not args.add_history:
-        # Use the now for filtering
-        df = df[df.index > now - pd.Timedelta(days=7)]
 
-    # Forward-fill the timestamp column for 5*24 = 120 hours ahead
+    start_recent = now - pd.Timedelta(days=7)
+    end_recent = now + pd.Timedelta(days=7)
+
+    # Create df_recent for data updates and predictions
+    df_recent = df_full.loc[start_recent:end_recent].copy()
+
+    # Forward-fill the timestamp column for future dates
     start_time = now + pd.Timedelta(hours=1)  # Start from the next hour
-    end_time = now + pd.Timedelta(hours=120)  # 5 days ahead
-    new_index = pd.date_range(start=start_time, end=end_time, freq='h')
-    df = df.reindex(df.index.union(new_index))
+    end_time = now + pd.Timedelta(days=7)  # 7 days ahead
+
+    # Actually end_time should be now + 7 days, but to the end of the day
+    end_time = end_time.replace(hour=23, minute=59, second=59)
+
+    future_index = pd.date_range(start=start_time, end=end_time, freq='h')
+    df_recent = df_recent.reindex(df_recent.index.union(future_index))
+
+    # Since FMI can remove weather stations from their API without notice, we should rely on .env.local
+    # rather than the database as the source of truth. Filter df_recent to include only columns
+    # corresponding to specified FMI weather station/temperature IDs, or columns that do not have
+    # the 'ws_'/'t_' prefix.
+    df_recent = df_recent[list(set(fmisid_ws + fmisid_t)
+                       | {col for col in set(df_recent.columns)
+                          if not col.startswith(('ws_', 't_'))})]
 
     # Reset the index to turn 'timestamp' back into a column before the update functions
-    df.reset_index(inplace=True)
-    df.rename(columns={'index': 'Timestamp'}, inplace=True)
+    df_recent.reset_index(inplace=True)
+    df_recent.rename(columns={'index': 'timestamp'}, inplace=True)
 
-    # Get the latest FMI wind speed values for the data frame, past and future
-    # NOTE: To save on API calls, this won't backfill history beyond 7 days even if asked
-    df = update_wind_speed(df)
-           
-    # Get the latest FMI temperature values for the data frame, past and future
-    # NOTE: To save on API calls, this won't backfill history beyond 7 days even if asked
-    df = update_temperature(df)
-       
-    # Get the latest nuclear power data for the data frame, and infer the future from last known value
-    # NOTE: To save on API calls, this won't backfill history beyond 7 days even if asked
-    df = update_nuclear(df, fingrid_api_key=fingrid_api_key)
+    # Update wind speed and temperature data
+    df_recent = update_wind_speed(df_recent)
+    df_recent = update_temperature(df_recent)
     
-    # Fetch future nuclear downtime information from ENTSO-E unavailability data, h/t github:@pkautio
+    # Update nuclear power data
+    df_recent = update_nuclear(df_recent, fingrid_api_key=fingrid_api_key)
+    
+    # Update import capacity data
+    df_recent = update_import_capacity(df_recent)
+
+    # Update Baltic Sea area wind speed data
+    df_recent = update_eu_ws(df_recent)
+
+    # Update wind power data
+    df_recent = update_windpower(df_recent, fingrid_api_key=fingrid_api_key)
+
+    # Fetch future nuclear downtime information from ENTSO-E unavailability data
     df_entso_e = entso_e_nuclear(entso_e_api_key)
-    
-    # Refresh the previously inferred nuclear power numbers with the ENTSO-E data
-    df = update_df_from_df(df, df_entso_e)
-    
+    if df_entso_e is not None:
+        # Refresh the previously inferred nuclear power numbers with the ENTSO-E data
+        df_recent = update_df_from_df(df_recent, df_entso_e)
+    else:
+        print("[WARNING] ENTSO-E data is unavailable. Using last known nuclear production value for predictions.")
+
     # Get the latest spot prices for the data frame, past and future if any
-    # NOTE: To save on API calls, this won't backfill history beyond 7 days even if asked
-    df = update_spot(df)
+    df_recent = update_spot(df_recent)
+
+    # Update holidays in the recent data
+    df_recent = update_holidays(df_recent)
     
-    # TODO: Decide if including wind power capacity is necessary; it seems to worsen the MSE and R2
-    # For now we'll drop it
-    df = df.drop(columns=['WindPowerCapacityMW'])
+    # Update solar irradiation data
+    df_recent = update_solar(df_recent)
 
-    # print("Filled-in dataframe before predict:\n", df)
-    print("→ Days of data coverage (should be 7 back, 5 forward for now): ", int(len(df)/24))
+    # Set 'timestamp' as index in df_recent
+    df_recent.set_index('timestamp', inplace=True)
 
-    # DEBUG: Save a copy of the df to a CSV file for inspection
-    # df.to_csv(os.path.join(data_folder_path + "/private", "debug_df.csv"), index=False)
+    # Update df_full with df_recent
+    df_full.update(df_recent)
 
-    # Fill in the 'hour', 'day_of_week', and 'month' columns for the model
-    df['Timestamp'] = pd.to_datetime(df['Timestamp'])
-    df['day_of_week'] = df['Timestamp'].dt.dayofweek + 1
-    df['hour'] = df['Timestamp'].dt.hour
-    df['month'] = df['Timestamp'].dt.month
-         
-    # Use (if coming from --train) or load and apply a Random Forest model for predictions
-    if rf_trained is None:
-        rf_model = joblib.load(rf_model_path)
-        print("→ Loaded the Random Forest model from", rf_model_path)
+    # Reset the index of df_full
+    df_full.reset_index(inplace=True)
+
+    # Prepare df_full for training
+    # print("Preparing data for training")
+    df_full['WindPowerCapacityMW'] = df_full['WindPowerCapacityMW'].ffill()
+    df_full['NuclearPowerMW'] = df_full['NuclearPowerMW'].ffill()
+    df_full['ImportCapacityMW'] = df_full['ImportCapacityMW'].ffill()
+
+    required_columns = ['timestamp', 'NuclearPowerMW', 'ImportCapacityMW', 'Price_cpkWh', 'WindPowerMW', 'holiday', 'sum_irradiance', 'mean_irradiance', 'std_irradiance', 'min_irradiance', 'max_irradiance'] + fmisid_t + fmisid_ws
+    df_full = df_full.dropna(subset=required_columns)
+
+    # Train the model
+    # print("Training the model with updated data")
+    model_trained = train_model(
+        df_full, fmisid_ws=fmisid_ws, fmisid_t=fmisid_t
+    )
+
+    # Prepare df_recent for prediction
+    df_recent.reset_index(inplace=True)
+    df_recent.rename(columns={'index': 'timestamp'}, inplace=True)
+    df_recent['timestamp'] = pd.to_datetime(df_recent['timestamp'])
+    df_recent['month'] = df_recent['timestamp'].dt.month
+    df_recent['day_of_week'] = df_recent['timestamp'].dt.dayofweek + 1
+    df_recent['hour'] = df_recent['timestamp'].dt.hour
+    df_recent['year'] = df_recent['timestamp'].dt.year
+
+    # Add cyclical transformations
+    df_recent['day_of_week_sin'] = np.sin(2 * np.pi * df_recent['day_of_week'] / 7)
+    df_recent['day_of_week_cos'] = np.cos(2 * np.pi * df_recent['day_of_week'] / 7)
+    df_recent['hour_sin'] = np.sin(2 * np.pi * df_recent['hour'] / 24)
+    df_recent['hour_cos'] = np.cos(2 * np.pi * df_recent['hour'] / 24)
+
+    # Calculate temp_mean and temp_variance
+    df_recent['temp_mean'] = df_recent[fmisid_t].mean(axis=1)
+    df_recent['temp_variance'] = df_recent[fmisid_t].var(axis=1)
+
+    # Define prediction features
+    prediction_features = [
+        'year', 'day_of_week_sin', 'day_of_week_cos', 'hour_sin', 'hour_cos',
+        'NuclearPowerMW', 'ImportCapacityMW', 'WindPowerMW',
+        'temp_mean', 'temp_variance', 'holiday', 
+        'sum_irradiance', 'mean_irradiance', 'std_irradiance', 'min_irradiance', 'max_irradiance',
+        'SE1_FI', 'SE3_FI', 'EE_FI',
+        'eu_ws_EE01', 'eu_ws_EE02', 'eu_ws_DK01', 'eu_ws_DK02', 'eu_ws_DE01', 'eu_ws_DE02', 'eu_ws_SE01', 'eu_ws_SE02', 'eu_ws_SE03'
+    ] + fmisid_t + fmisid_ws
+
+    # Predict the prices
+    print("Predicting prices with the trained model")
+    price_df = model_trained.predict(df_recent[prediction_features])
+    df_recent['PricePredict_cpkWh'] = price_df
+
+    # Clean up all unnecessary columns before DB commit or display
+    df_recent = df_recent.drop(columns=[
+        'year', 'day_of_week', 'hour', 'month',
+        'day_of_week_sin', 'day_of_week_cos',
+        'hour_sin', 'hour_cos', 
+        'temp_mean', 'temp_variance'
+    ])
+
+    # Describe the predictions
+    print(df_recent)
+    print(df_recent.describe())    
+
+    # --commit: Update the database with the final data
+    if args.commit:
+        print("* Will add/update", len(df_recent), "predictions to the database ", end="")
+        if db_update(db_path, df_recent):
+            print("Database updated with new predictions. You may want to --deploy next if you need the JSON predictions for further use.")
     else:
-        rf_model = rf_trained
-        print("→ Found a newly created in-memory model for predictions")
-        
-    price_df = rf_model.predict(df[['day_of_week', 'hour', 'month', 'NuclearPowerMW'] + fmisid_ws + fmisid_t])
-    df['PricePredict_cpkWh'] = price_df
-    
-    # We drop these columns before commit/display, as we can later compute them from the timestamp
-    df = df.drop(columns=['day_of_week', 'hour', 'month'])
-
-    # We are going to be verbose and ask before committing a lot of data to the database    
-    if args.add_history:
-        pd.set_option('display.max_columns', None)
-        print("Spot Prices random sample of 20:\n", df.sample(20))
-        
-        # Create a new DataFrame for calculating the metrics
-        metrics_df = df[['Price_cpkWh', 'PricePredict_cpkWh']].copy()
-        
-        # Drop the rows with NaN values in 'Price_cpkWh' or 'PricePredict_cpkWh'
-        metrics_df = metrics_df.dropna(subset=['Price_cpkWh', 'PricePredict_cpkWh'])
-        
-        # Calculate the metrics
-        y_true = metrics_df['Price_cpkWh']
-        y_pred = metrics_df['PricePredict_cpkWh']
-        
-        mae = mean_absolute_error(y_true, y_pred)
-        mse = mean_squared_error(y_true, y_pred)
-        rmse = np.sqrt(mse)
-        r2 = r2_score(y_true, y_pred)
-        
-        print("Mean Absolute Error:", mae, "c/kWh")
-        print("Mean Squared Error:", mse, "c/kWh")
-        print("Root Mean Squared Error:", rmse, "c/kWh")
-        print("R-squared:", r2)
-   
-    # Update the database with the final data
-    if args.commit:    
-        if args.add_history:        
-            # Ask if the user wants to add the predictions to the database
-            if input("Do you want to add the retrospective predictions to the database? (y/n): ").lower() != "y":
-                print("Aborting.")
-                exit()          
-        
-        print("Will add/update", len(df), "predictions to the database... ", end="")
-        
-        if db_update(db_path, df):
-            print("Database updated. You may want to --deploy next if you need the JSON predictions for further use.")
-    else:
-        print(df)
         print("* Predictions NOT committed to the database (no --commit).")
-        
-    # DEBUG: save to CSV for inspection
-    # df.to_csv(os.path.join(data_folder_path + "/private", "predictions_df.csv"), index=False)    
-    # exit()
 
-# Narrate can be used with the previous arguments
+# -----------------------------------------------------------------------------------------------------------------------------
+# --narrate: Generate narration
 if args.narrate:
-    print("Narrating predictions...")
-    tomorrow = datetime.now(pytz.utc).replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
-    narration = narrate_prediction(tomorrow)
-
+    print("Narrating predictions")
+    narration = narrate_prediction()
     if args.commit:
         # Create/update deploy/narration.md
         narration_path = os.path.join(deploy_folder_path, narration_file)
@@ -347,19 +277,16 @@ if args.narrate:
             f.write(narration)
         print(narration)
         print(f"Narration saved to {narration_path}")
-        
     else:
         print(narration)
 
-# Deploy can be done solo, or with --predict and --narrate
-# Note that we have a dedicated --github argument to push to GitHub (not many need to use it)
+# -----------------------------------------------------------------------------------------------------------------------------
+# --deploy: Deploy the output files
 if args.deploy:
-    print("Deploing the latest prediction data:", deploy_folder_path, "...")
-    
-    publish_df = db_query_all(db_path)
+    print("Deploying the latest prediction data to:", deploy_folder_path, "...")
 
-    # Ensure 'timestamp' column is in datetime format
-    publish_df['timestamp'] = pd.to_datetime(publish_df['timestamp'])
+    deploy_df = db_query_all(db_path)
+    deploy_df['timestamp'] = pd.to_datetime(deploy_df['timestamp'])
 
     # Helsinki time zone setup
     helsinki_tz = pytz.timezone('Europe/Helsinki')
@@ -371,40 +298,60 @@ if args.deploy:
     start_of_yesterday_utc = start_of_yesterday_helsinki.astimezone(pytz.utc)
 
     # Ensure 'timestamp' column is in datetime format and UTC for comparison
-    publish_df['timestamp'] = pd.to_datetime(publish_df['timestamp']).dt.tz_localize(None).dt.tz_localize(pytz.utc)
+    deploy_df['timestamp'] = deploy_df['timestamp'].dt.tz_localize(None).dt.tz_localize(pytz.utc)
 
     # Filter out rows where 'timestamp' is earlier than the start of yesterday in Helsinki, adjusted to UTC
-    publish_df = publish_df[publish_df['timestamp'] >= start_of_yesterday_utc]
-    hourly_predictions = publish_df[['timestamp', 'PricePredict_cpkWh']].copy()
-    hourly_predictions['timestamp'] = hourly_predictions['timestamp'].dt.tz_localize(None) if hourly_predictions['timestamp'].dt.tz is not None else hourly_predictions['timestamp']
-    hourly_predictions['timestamp'] = hourly_predictions['timestamp'].apply(
+    deploy_df = deploy_df[deploy_df['timestamp'] >= start_of_yesterday_utc]
+
+    # Hourly Price Predictions
+    hourly_price_predictions = deploy_df[['timestamp', 'PricePredict_cpkWh']].copy()
+    hourly_price_predictions['timestamp'] = hourly_price_predictions['timestamp'].dt.tz_localize(None) if hourly_price_predictions['timestamp'].dt.tz is not None else hourly_price_predictions['timestamp']
+    hourly_price_predictions['timestamp'] = hourly_price_predictions['timestamp'].apply(
         lambda x: (x - pd.Timestamp("1970-01-01")) // pd.Timedelta('1ms')
     )
 
-    # Write prediction.json to the deploy folder
-    json_data_list = hourly_predictions.values.tolist()
+    # Write price prediction.json to the deploy folder
+    json_data_list = hourly_price_predictions.values.tolist()
     json_data = json.dumps(json_data_list, ensure_ascii=False)
     json_path = os.path.join(deploy_folder_path, predictions_file)
     with open(json_path, 'w') as f:
         f.write(json_data)
-    print(f"→ Hourly predictions saved to {json_path}")
+    print(f"→ Hourly price predictions saved to {json_path}")
 
     # Create/update the snapshot JSON file for today's predictions
-    # TODO: Remove fixed file name, derive from .env.local
     create_prediction_snapshot(deploy_folder_path, json_data_list, "prediction_snapshot")
 
-    # Rotate snapshots to maintain only the latest 6 (+today=7)
-    # TODO: Remove fixed file name, derive from .env.local
-    rotate_snapshots(deploy_folder_path, pattern="prediction_snapshot*", max_files=6)
+    # Rotate snapshots to maintain the latest X snapshots
+    rotate_snapshots(deploy_folder_path, pattern="prediction_snapshot*", max_files=40)
 
-    # Normalize 'timestamp' to set the time to 00:00:00 for daily average grouping
-    publish_df['timestamp'] = publish_df['timestamp'].dt.tz_localize(None) if publish_df['timestamp'].dt.tz is not None else publish_df['timestamp']
-    publish_df['timestamp'] = publish_df['timestamp'].dt.normalize()
-    daily_averages = publish_df.groupby('timestamp')['PricePredict_cpkWh'].mean().reset_index()
-
-    # Before applying lambda, ensure 'timestamp' is timezone-naive for consistency
-    daily_averages['timestamp'] = daily_averages['timestamp'].apply(
+    # Hourly Wind Power Predictions
+    windpower_preds = deploy_df[['timestamp', 'WindPowerMW']].copy()
+    windpower_preds['timestamp'] = windpower_preds['timestamp'].dt.tz_localize(None) if windpower_preds['timestamp'].dt.tz is not None else windpower_preds['timestamp']
+    windpower_preds['timestamp'] = windpower_preds['timestamp'].apply(
         lambda x: (x - pd.Timestamp("1970-01-01")) // pd.Timedelta('1ms')
+    )
+
+    # Write wind power prediction JSON to the deploy folder
+    json_data_list = windpower_preds.values.tolist()
+    json_data = json.dumps(json_data_list, ensure_ascii=False)
+    json_path_wind = os.path.join(deploy_folder_path, 'windpower.json')
+    with open(json_path_wind, 'w') as f:
+        f.write(json_data)
+    print(f"→ Hourly wind power predictions saved to {json_path_wind}")
+
+    # Convert timestamps to Helsinki timezone
+    deploy_df['timestamp'] = deploy_df['timestamp'].dt.tz_convert(helsinki_tz)
+
+    # Normalize 'timestamp' to set the time to 00:00:00 for daily average grouping in local time
+    deploy_df['timestamp'] = deploy_df['timestamp'].dt.normalize()
+
+    # Calculate daily averages in Helsinki time
+    daily_averages = deploy_df.groupby('timestamp')['PricePredict_cpkWh'].mean().reset_index()
+
+    # Convert timestamps back to UTC for the JSON output
+    daily_averages['timestamp'] = daily_averages['timestamp'].dt.tz_convert(pytz.utc)
+    daily_averages['timestamp'] = daily_averages['timestamp'].apply(
+        lambda x: int((x - pd.Timestamp("1970-01-01", tz='utc')) // pd.Timedelta('1ms'))
     )
 
     # Save the daily averages to a JSON file in the deploy folder
@@ -414,22 +361,10 @@ if args.deploy:
     with open(json_path, 'w') as f:
         f.write(json_data)
     print(f"→ Daily averages saved to {json_path}")
-
-    # Commit and push the updates to GitHub
-    if args.github:
-        files_to_push = [predictions_file, averages_file, narration_file]
-
-        try:
-            if push_updates_to_github(repo_path, deploy_folder_path, files_to_push, commit_message):
-                print("Data pushed to GitHub.")
-        except Exception as e:
-            print("Error occurred while pushing data to GitHub: ", str(e))
-
-        print("Script execution completed.")
-
-    exit()
-
+    
+# -----------------------------------------------------------------------------------------------------------------------------
 if __name__ == "__main__":
+    
     # If no arguments were given, print usage
     if not any(vars(args).values()):
         print("No arguments given.")

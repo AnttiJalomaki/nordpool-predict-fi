@@ -74,7 +74,7 @@ df = fetch_data_from_github(url)
 if df is not None:
     # Define a start and end date for filtering
     start_date = datetime.now()
-    end_date = datetime.now() + timedelta(days=5)
+    end_date = datetime.now() + timedelta(days=7)
 
     # Filter the data based on the defined range
     filtered_df = date_range_filter(df, start_date, end_date)
@@ -82,9 +82,9 @@ if df is not None:
     # Convert the timestamp to Helsinki timestamp if --helsinki option is used
     if args.helsinki:
         filtered_df = convert_to_helsinki_time(filtered_df)
-        print("Helsinki time /w price in c/kWh VAT 24%:")
+        print("Helsinki time /w price in c/kWh VAT:")
     else:
-        print("UTC time, price in c/kWh VAT 24%:")
+        print("UTC time, price in c/kWh VAT:")
 
     # Show what the filtered data looks like
     print(filtered_df)

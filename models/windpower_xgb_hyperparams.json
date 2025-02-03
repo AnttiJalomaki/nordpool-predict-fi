@@ -1,0 +1,13 @@
+{
+    "max_depth": 6,
+    "n_estimators": 11686,
+    "learning_rate": 0.013570984895073438,
+    "subsample": 0.3316427519913445,
+    "colsample_bytree": 0.827599041831827,
+    "gamma": 0.05284185782198264,
+    "reg_alpha": 0.16692537415276604,
+    "reg_lambda": 0.908763441001726,
+    "random_state": 42,
+    "test_size": 0.1,
+    "early_stopping_rounds": 50
+}

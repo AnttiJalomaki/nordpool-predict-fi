@@ -2,7 +2,7 @@ type: custom:apexcharts-card
 now:
   show: true
   label: now
-graph_span: 5d
+graph_span: 8d
 experimental:
   color_threshold: true
 apex_config:
@@ -21,7 +21,6 @@ apex_config:
   yaxis:
     decimalsInFloat: 1
     forceNiceScale: true
-    min: 0
   xaxis:
     type: datetime
     labels:
@@ -44,7 +43,7 @@ series:
     type: column
     float_precision: 3
     stroke_width: 0
-    opacity: 0.2
+    opacity: 0.33
     fill_raw: 'null'
     unit: ¢/kWh
     name: Nordpool ¢/kWh
@@ -54,10 +53,10 @@ series:
       extremas: false
     data_generator: |
       return [...entity.attributes.raw_today.map((start, index) => {
-                return [new Date(start["start"]).getTime(), entity.attributes.raw_today[index]["value"]*124];
+                return [new Date(start["start"]).getTime(), entity.attributes.raw_today[index]["value"]*125.5];
              }),
              ...entity.attributes.raw_tomorrow.map((entry) => {
-                return [new Date(entry.start).getTime(), entry.value*124];
+                return [new Date(entry.start).getTime(), entry.value*125.5];
              }),
              // Add a new entry for the day after tomorrow with a zero value
              [new Date(new Date().setDate(new Date().getDate() + 2)).setHours(0, 0, 0, 0), 0]
@@ -80,7 +79,7 @@ series:
       - value: 20
         color: darkred
       - value: 30
-        color: black
+        color: purple
   - entity: sensor.nordpool_kwh_fi_eur_3_10_0
     type: line
     float_precision: 3
@@ -105,7 +104,7 @@ series:
         color: darkred
         opacity: 0.8
       - value: 30
-        color: black
+        color: purple
         opacity: 0.8
     show:
       in_header: false

@@ -40,34 +40,77 @@ data_path = sys.argv[1]  # Use the provided command-line argument for the data p
 data = pd.read_csv(data_path)
 
 # Preprocess the dataset
-data['timestamp'] = pd.to_datetime(data['timestamp'])
+data['timestamp'] = pd.to_datetime(data['timestamp'], utc=True)
 data['MonthNumber'] = data['timestamp'].dt.month
 data['WeekdayNumber'] = data['timestamp'].dt.weekday
 data['HourNumber'] = data['timestamp'].dt.hour
-data.drop(columns=['WindPowerCapacityMW', 'PricePredict_cpkWh', 'timestamp'], inplace=True)
-data = data.dropna()
+
+# Outlier removal using the IQR method
+Q1 = data['Price_cpkWh'].quantile(0.25)
+Q3 = data['Price_cpkWh'].quantile(0.75)
+IQR = Q3 - Q1
+
+# Adjust the multiplier if necessary, e.g., 2.5 as in `train.py`
+min_threshold = Q1 - 2.5 * IQR
+max_threshold = Q3 + 2.5 * IQR
+data_filtered = data[(data['Price_cpkWh'] >= min_threshold) & (data['Price_cpkWh'] <= max_threshold)]
+
+# Drop irrelevant columns after filtering
+data_filtered.drop(columns=['WindPowerCapacityMW', 'PricePredict_cpkWh', 'timestamp'], inplace=True)
 
 # Select features and target variable
-features = ['MonthNumber', 'WeekdayNumber', 'HourNumber', 'ws_101256', 'ws_101267', 'ws_101673', 'ws_101846', 't_101118', 't_101339', 't_101786', 't_100968']
-X = data[features]
-y = data['Price_cpkWh']
+features = [
+    'MonthNumber', 'WeekdayNumber', 'HourNumber', 
+    'ws_101256', 'ws_101267', 'ws_101673', 'ws_101846', 
+    't_101118', 't_101339', 't_101786', 't_100968', 
+    'NuclearPowerMW', 'ImportCapacityMW'
+]
+
+X = data_filtered[features]
+y = data_filtered['Price_cpkWh']
 
 # Split the data into training and testing sets (80/20 split)
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+X_train, X_test, y_train, y_test = train_test_split(
+    X, 
+    y, 
+    test_size=0.2, 
+    random_state=42
+    )
 
-# Define a grid of hyperparameters for tuning, including 'max_features'
+# Define a grid of hyperparameters for tuning
+# param_grid = {
+#     'n_estimators': [400, 500, 600],
+#     'max_depth': [30, 35, 40, None],
+#     'min_samples_split': [2, 3],
+#     'min_samples_leaf': [1, 2],
+#     'max_features': [0.4, 0.5, 0.6],
+#     'bootstrap': [False],
+#     'criterion': ['squared_error', 'absolute_error']
+# }
+
+# Searching from higher values too
 param_grid = {
-    'n_estimators': [50, 100, 150, 200],
-    'max_depth': [None, 10, 20, 30],
-    'min_samples_split': [2, 4, 6],
-    'min_samples_leaf': [1, 2, 4],
-    'max_features': ['sqrt', None, 0.5]
-    }
+    'n_estimators': [600, 700, 800],  # Increase beyond 600 to explore further improvements
+    'max_depth': [40, 45, None],      # Expand to deeper trees, including unrestricted depth
+    'min_samples_split': [2, 3],      # Keep the most promising lower values
+    'min_samples_leaf': [1, 2],       # Continue focusing on low values
+    'max_features': [0.45, 0.5, 0.55],# Fine-tune around the promising 0.5 value
+    'bootstrap': [False],             # Continue with no bootstrapping as it performed better
+    'criterion': ['squared_error', 'absolute_error']  # Test both MSE and MAE criteria
+}
 
 # Initialize and perform the grid search on the training set
-grid_search = GridSearchCV(RandomForestRegressor(random_state=42), param_grid, cv=5,
-                           scoring={'MAE': 'neg_mean_absolute_error', 'MSE': 'neg_mean_squared_error', 'RMSE': rmse_scorer, 'R2': 'r2'},
-                           refit='MAE', return_train_score=True, verbose=3, n_jobs=-1)
+grid_search = GridSearchCV(
+    RandomForestRegressor(random_state=42), 
+    param_grid, 
+    cv=7,
+    scoring={'MAE': 'neg_mean_absolute_error', 'MSE': 'neg_mean_squared_error', 'RMSE': rmse_scorer, 'R2': 'r2'},
+    refit='MAE', 
+    return_train_score=True, 
+    verbose=3, 
+    n_jobs=-1
+)
+
 grid_search.fit(X_train, y_train)
 
 # After completion, output the best parameters and their corresponding scores
@@ -88,17 +131,3 @@ test_r2 = r2_score(y_test, y_pred)
 print("Test MSE:", test_mse)
 print("Test RMSE:", test_rmse)
 print("Test R^2:", test_r2)
-
-# First run:
-# Best parameters: {'max_depth': 20, 'min_samples_leaf': 4, 'min_samples_split': 2, 'n_estimators': 150}
-# Best MAE (validation): 4.0287002630635556
-# Best MSE (validation): 68.55174752722753
-# Best RMSE (validation): 7.474467935623276
-
-# Second run:
-# Best parameters: {'max_depth': 20, 'min_samples_leaf': 4, 'min_samples_split': 2, 'n_estimators': 150}
-# Best MAE (validation): 4.0287002630635556
-# Best MSE (validation): 68.55174752722753
-# Best RMSE (validation): 7.474467935623276
-# Best R^2 (validation): 0.1444278396002968
-
